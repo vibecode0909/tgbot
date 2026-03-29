@@ -1,0 +1,4 @@
+node_modules
+.env
+chat_id.txt
+tasks.json
