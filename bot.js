@@ -1,97 +1,109 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const cron = require('node-cron');
-const fs = require('fs');
+const { Pool } = require('pg');
 
 // --- НАСТРОЙКИ ---
 const TOKEN = process.env.TOKEN;
-const CHAT_ID_FILE = 'chat_id.txt';
-const TASKS_FILE = 'tasks.json';
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
 // --- ИНИЦИАЛИЗАЦИЯ БОТА ---
 const bot = new TelegramBot(TOKEN, { polling: true });
 
+// --- СОЗДАНИЕ ТАБЛИЦ ПРИ ЗАПУСКЕ ---
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id SERIAL PRIMARY KEY,
+      chat_id BIGINT NOT NULL,
+      text TEXT NOT NULL,
+      done BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('База данных готова ✅');
+}
+
 // --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-function loadTasks() {
-  if (!fs.existsSync(TASKS_FILE)) return [];
-  return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));
+async function getTasks(chatId) {
+  const res = await pool.query(
+    'SELECT * FROM tasks WHERE chat_id = $1 ORDER BY created_at',
+    [chatId]
+  );
+  return res.rows;
 }
 
-function saveTasks(tasks) {
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2));
+async function addTask(chatId, text) {
+  await pool.query(
+    'INSERT INTO tasks (chat_id, text) VALUES ($1, $2)',
+    [chatId, text]
+  );
 }
 
-function saveChatId(chatId) {
-  fs.writeFileSync(CHAT_ID_FILE, String(chatId));
+async function markDone(taskId) {
+  await pool.query('UPDATE tasks SET done = TRUE WHERE id = $1', [taskId]);
 }
 
-function loadChatId() {
-  if (!fs.existsSync(CHAT_ID_FILE)) return null;
-  return fs.readFileSync(CHAT_ID_FILE, 'utf8').trim();
+async function clearDone(chatId) {
+  await pool.query(
+    'DELETE FROM tasks WHERE chat_id = $1 AND done = TRUE',
+    [chatId]
+  );
 }
 
 // --- КОМАНДЫ БОТА ---
 
-// /start — приветствие
-bot.onText(/\/start/, (msg) => {
-  saveChatId(msg.chat.id);
+// /start
+bot.onText(/\/start/, async (msg) => {
   bot.sendMessage(msg.chat.id,
     '👋 Привет! Я твой Todo-бот.\n\n' +
     'Команды:\n' +
     '/add Текст задачи — добавить задачу\n' +
     '/list — показать все задачи\n' +
-    '/clear — удалить все выполненные задачи'
+    '/clear — удалить выполненные задачи'
   );
 });
 
-// /add — добавить задачу
-bot.onText(/\/add (.+)/, (msg, match) => {
-  saveChatId(msg.chat.id);
-  const tasks = loadTasks();
-  const newTask = {
-    id: Date.now(),
-    text: match[1],
-    done: false
-  };
-  tasks.push(newTask);
-  saveTasks(tasks);
-  bot.sendMessage(msg.chat.id, `✅ Задача добавлена: "${newTask.text}"`);
+// /add
+bot.onText(/\/add (.+)/, async (msg, match) => {
+  await addTask(msg.chat.id, match[1]);
+  bot.sendMessage(msg.chat.id, `✅ Задача добавлена: "${match[1]}"`);
 });
 
-// /list — показать задачи с кнопками
-bot.onText(/\/list/, (msg) => {
-  saveChatId(msg.chat.id);
-  const tasks = loadTasks();
+// /list
+bot.onText(/\/list/, async (msg) => {
+  const tasks = await getTasks(msg.chat.id);
   if (tasks.length === 0) {
     bot.sendMessage(msg.chat.id, '📭 Список задач пуст. Добавь задачу через /add');
     return;
   }
-  tasks.forEach((task) => {
+  for (const task of tasks) {
     const status = task.done ? '✅' : '🔲';
     const buttons = task.done
       ? []
       : [[{ text: '✅ Выполнено', callback_data: `done_${task.id}` }]];
-    bot.sendMessage(msg.chat.id, `${status} ${task.text}`, {
+    await bot.sendMessage(msg.chat.id, `${status} ${task.text}`, {
       reply_markup: { inline_keyboard: buttons }
     });
-  });
+  }
 });
 
-// /clear — удалить выполненные задачи
-bot.onText(/\/clear/, (msg) => {
-  const tasks = loadTasks().filter(t => !t.done);
-  saveTasks(tasks);
+// /clear
+bot.onText(/\/clear/, async (msg) => {
+  await clearDone(msg.chat.id);
   bot.sendMessage(msg.chat.id, '🗑️ Выполненные задачи удалены.');
 });
 
-// Нажатие кнопки "Выполнено"
-bot.on('callback_query', (query) => {
+// Кнопка "Выполнено"
+bot.on('callback_query', async (query) => {
   const taskId = parseInt(query.data.replace('done_', ''));
-  const tasks = loadTasks();
-  const task = tasks.find(t => t.id === taskId);
+  const res = await pool.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
+  const task = res.rows[0];
   if (task) {
-    task.done = true;
-    saveTasks(tasks);
+    await markDone(taskId);
     bot.editMessageText(`✅ Выполнено: ${task.text}`, {
       chat_id: query.message.chat.id,
       message_id: query.message.message_id
@@ -100,18 +112,25 @@ bot.on('callback_query', (query) => {
   bot.answerCallbackQuery(query.id);
 });
 
-// --- НАПОМИНАНИЯ (10:00, 14:00, 19:00) ---
-function sendReminder() {
-  const chatId = loadChatId();
-  if (!chatId) return;
-  const tasks = loadTasks().filter(t => !t.done);
-  if (tasks.length === 0) return;
-  const list = tasks.map(t => `🔲 ${t.text}`).join('\n');
-  bot.sendMessage(chatId, `⏰ Напоминание! Незавершённые задачи:\n\n${list}`);
+// --- НАПОМИНАНИЯ ---
+async function sendReminders() {
+  const res = await pool.query(
+    'SELECT DISTINCT chat_id FROM tasks WHERE done = FALSE'
+  );
+  for (const row of res.rows) {
+    const tasks = await getTasks(row.chat_id);
+    const pending = tasks.filter(t => !t.done);
+    if (pending.length === 0) continue;
+    const list = pending.map(t => `🔲 ${t.text}`).join('\n');
+    bot.sendMessage(row.chat_id, `⏰ Напоминание! Незавершённые задачи:\n\n${list}`);
+  }
 }
 
-cron.schedule('0 10 * * *', sendReminder); // 10:00
-cron.schedule('0 14 * * *', sendReminder); // 14:00
-cron.schedule('0 19 * * *', sendReminder); // 19:00
+cron.schedule('0 10 * * *', sendReminders); // 10:00
+cron.schedule('0 14 * * *', sendReminders); // 14:00
+cron.schedule('0 19 * * *', sendReminders); // 19:00
 
-console.log('Бот запущен! 🚀');
+// --- ЗАПУСК ---
+initDB().then(() => {
+  console.log('Бот запущен! 🚀');
+});
