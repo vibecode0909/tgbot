@@ -10,19 +10,23 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// --- ИНИЦИАЛИЗАЦИЯ БОТА ---
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// --- СОЗДАНИЕ ТАБЛИЦ ПРИ ЗАПУСКЕ ---
+// --- ИНИЦИАЛИЗАЦИЯ БД ---
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
       id SERIAL PRIMARY KEY,
       chat_id BIGINT NOT NULL,
       text TEXT NOT NULL,
+      deadline TEXT DEFAULT NULL,
       done BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     )
+  `);
+  // Добавляем колонку deadline если её ещё нет (для старой таблицы)
+  await pool.query(`
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline TEXT DEFAULT NULL
   `);
   console.log('База данных готова ✅');
 }
@@ -36,10 +40,10 @@ async function getTasks(chatId) {
   return res.rows;
 }
 
-async function addTask(chatId, text) {
+async function addTask(chatId, text, deadline = null) {
   await pool.query(
-    'INSERT INTO tasks (chat_id, text) VALUES ($1, $2)',
-    [chatId, text]
+    'INSERT INTO tasks (chat_id, text, deadline) VALUES ($1, $2, $3)',
+    [chatId, text, deadline]
   );
 }
 
@@ -54,23 +58,49 @@ async function clearDone(chatId) {
   );
 }
 
+function formatTask(task) {
+  const status = task.done ? '✅' : '🔲';
+  const deadline = task.deadline ? ` ⏰ ${task.deadline}` : '';
+  return `${status} ${task.text}${deadline}`;
+}
+
 // --- КОМАНДЫ БОТА ---
 
 // /start
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
     '👋 Привет! Я твой Todo-бот.\n\n' +
     'Команды:\n' +
     '/add Текст задачи — добавить задачу\n' +
+    '/add Текст задачи 18:00 — добавить задачу с дедлайном\n' +
     '/list — показать все задачи\n' +
     '/clear — удалить выполненные задачи'
   );
 });
 
-// /add
+// /add — с дедлайном или без
 bot.onText(/\/add (.+)/, async (msg, match) => {
-  await addTask(msg.chat.id, match[1]);
-  bot.sendMessage(msg.chat.id, `✅ Задача добавлена: "${match[1]}"`);
+  const input = match[1].trim();
+
+  // Проверяем есть ли время в конце (формат ЧЧ:ММ)
+  const timeMatch = input.match(/^(.*)\s(\d{1,2}:\d{2})$/);
+
+  let text, deadline;
+  if (timeMatch) {
+    text = timeMatch[1].trim();
+    deadline = timeMatch[2];
+  } else {
+    text = input;
+    deadline = null;
+  }
+
+  await addTask(msg.chat.id, text, deadline);
+
+  const reply = deadline
+    ? `✅ Задача добавлена: "${text}" ⏰ ${deadline}`
+    : `✅ Задача добавлена: "${text}"`;
+
+  bot.sendMessage(msg.chat.id, reply);
 });
 
 // /list
@@ -81,11 +111,10 @@ bot.onText(/\/list/, async (msg) => {
     return;
   }
   for (const task of tasks) {
-    const status = task.done ? '✅' : '🔲';
     const buttons = task.done
       ? []
       : [[{ text: '✅ Выполнено', callback_data: `done_${task.id}` }]];
-    await bot.sendMessage(msg.chat.id, `${status} ${task.text}`, {
+    await bot.sendMessage(msg.chat.id, formatTask(task), {
       reply_markup: { inline_keyboard: buttons }
     });
   }
@@ -121,14 +150,14 @@ async function sendReminders() {
     const tasks = await getTasks(row.chat_id);
     const pending = tasks.filter(t => !t.done);
     if (pending.length === 0) continue;
-    const list = pending.map(t => `🔲 ${t.text}`).join('\n');
+    const list = pending.map(t => formatTask(t)).join('\n');
     bot.sendMessage(row.chat_id, `⏰ Напоминание! Незавершённые задачи:\n\n${list}`);
   }
 }
 
-cron.schedule('0 10 * * *', sendReminders); // 10:00
-cron.schedule('0 14 * * *', sendReminders); // 14:00
-cron.schedule('0 19 * * *', sendReminders); // 19:00
+cron.schedule('0 10 * * *', sendReminders);
+cron.schedule('0 14 * * *', sendReminders);
+cron.schedule('0 19 * * *', sendReminders);
 
 // --- ЗАПУСК ---
 initDB().then(() => {
