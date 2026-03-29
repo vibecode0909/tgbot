@@ -21,13 +21,12 @@ async function initDB() {
       text TEXT NOT NULL,
       deadline TEXT DEFAULT NULL,
       done BOOLEAN DEFAULT FALSE,
+      reminded BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
-  // Добавляем колонку deadline если её ещё нет (для старой таблицы)
-  await pool.query(`
-    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline TEXT DEFAULT NULL
-  `);
+  await pool.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline TEXT DEFAULT NULL`);
+  await pool.query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminded BOOLEAN DEFAULT FALSE`);
   console.log('База данных готова ✅');
 }
 
@@ -66,7 +65,6 @@ function formatTask(task) {
 
 // --- КОМАНДЫ БОТА ---
 
-// /start
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
     '👋 Привет! Я твой Todo-бот.\n\n' +
@@ -78,11 +76,8 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// /add — с дедлайном или без
 bot.onText(/\/add (.+)/, async (msg, match) => {
   const input = match[1].trim();
-
-  // Проверяем есть ли время в конце (формат ЧЧ:ММ)
   const timeMatch = input.match(/^(.*)\s(\d{1,2}:\d{2})$/);
 
   let text, deadline;
@@ -97,13 +92,12 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
   await addTask(msg.chat.id, text, deadline);
 
   const reply = deadline
-    ? `✅ Задача добавлена: "${text}" ⏰ ${deadline}`
+    ? `✅ Задача добавлена: "${text}" ⏰ ${deadline}\n🔔 Напомню за 30 минут до дедлайна`
     : `✅ Задача добавлена: "${text}"`;
 
   bot.sendMessage(msg.chat.id, reply);
 });
 
-// /list
 bot.onText(/\/list/, async (msg) => {
   const tasks = await getTasks(msg.chat.id);
   if (tasks.length === 0) {
@@ -120,13 +114,11 @@ bot.onText(/\/list/, async (msg) => {
   }
 });
 
-// /clear
 bot.onText(/\/clear/, async (msg) => {
   await clearDone(msg.chat.id);
   bot.sendMessage(msg.chat.id, '🗑️ Выполненные задачи удалены.');
 });
 
-// Кнопка "Выполнено"
 bot.on('callback_query', async (query) => {
   const taskId = parseInt(query.data.replace('done_', ''));
   const res = await pool.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
@@ -141,8 +133,8 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id);
 });
 
-// --- НАПОМИНАНИЯ ---
-async function sendReminders() {
+// --- ДНЕВНЫЕ СВОДКИ (10:00, 15:00, 21:00) ---
+async function sendDailySummary(timeLabel) {
   const res = await pool.query(
     'SELECT DISTINCT chat_id FROM tasks WHERE done = FALSE'
   );
@@ -151,13 +143,44 @@ async function sendReminders() {
     const pending = tasks.filter(t => !t.done);
     if (pending.length === 0) continue;
     const list = pending.map(t => formatTask(t)).join('\n');
-    bot.sendMessage(row.chat_id, `⏰ Напоминание! Незавершённые задачи:\n\n${list}`);
+    bot.sendMessage(row.chat_id,
+      `🌅 Сводка на ${timeLabel}. Незавершённые задачи:\n\n${list}`
+    );
   }
 }
 
-cron.schedule('0 10 * * *', sendReminders);
-cron.schedule('0 14 * * *', sendReminders);
-cron.schedule('0 19 * * *', sendReminders);
+cron.schedule('0 10 * * *', () => sendDailySummary('10:00'));
+cron.schedule('0 15 * * *', () => sendDailySummary('15:00'));
+cron.schedule('0 21 * * *', () => sendDailySummary('21:00'));
+
+// --- НАПОМИНАНИЕ ЗА 30 МИНУТ ДО ДЕДЛАЙНА ---
+async function checkDeadlines() {
+  const now = new Date();
+  const currentHour = now.getHours();
+  const currentMinute = now.getMinutes();
+
+  // Считаем время через 30 минут
+  const reminderTime = new Date(now.getTime() + 30 * 60 * 1000);
+  const reminderHour = reminderTime.getHours();
+  const reminderMinute = reminderTime.getMinutes();
+  const reminderString = `${String(reminderHour).padStart(2, '0')}:${String(reminderMinute).padStart(2, '0')}`;
+
+  // Ищем задачи с дедлайном через 30 минут, которым ещё не напоминали
+  const res = await pool.query(
+    'SELECT * FROM tasks WHERE deadline = $1 AND done = FALSE AND reminded = FALSE',
+    [reminderString]
+  );
+
+  for (const task of res.rows) {
+    bot.sendMessage(task.chat_id,
+      `🔔 Напоминание! Через 30 минут:\n\n⏰ ${task.text} в ${task.deadline}`
+    );
+    await pool.query('UPDATE tasks SET reminded = TRUE WHERE id = $1', [task.id]);
+  }
+}
+
+// Проверяем каждую минуту
+cron.schedule('* * * * *', checkDeadlines);
 
 // --- ЗАПУСК ---
 initDB().then(() => {
